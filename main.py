@@ -9,8 +9,10 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
+from torchvision.models import resnet50, ResNet50_Weights
 from transformers import BertTokenizer, BertModel
 import unicodedata
+from collections import Counter
 from nltk.corpus import stopwords
 from nltk.stem import PorterStemmer, WordNetLemmatizer
 import nltk
@@ -89,26 +91,38 @@ def process_text(text):
     # 句読点をスペースに変換
     text = re.sub(r"[^\w\s':]", ' ', text)
 
+    # カンマの前の空白を削除（誤って2回記述されていた処理を修正）
+    text = re.sub(r'\s+,', ',', text)
+
     # 連続するスペースを1つに変換
     text = re.sub(r'\s+', ' ', text).strip()
 
-    # 文字の正規化
-    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
-
-    # ストップワードの削除
-    stop_words = set(stopwords.words('english'))
-    text = ' '.join([word for word in text.split() if word not in stop_words])
-
     return text
+
+
+def get_mode_answer(answers, ignore_unanswerable=True):
+    processed_answers = [process_text(answer["answer"]) for answer in answers]
+
+    if ignore_unanswerable:
+        processed_answers = [ans for ans in processed_answers if ans.lower() != "unanswerable"]
+
+    if not processed_answers:  # すべての回答が "unanswerable" だった場合
+        return "unanswerable"
+
+    answer_counts = Counter(processed_answers)
+    return max(answer_counts, key=answer_counts.get)
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
+    def __init__(self, df_path, image_dir, transform=None, answer=True, unanswerable_skip_rate=0.3):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pd.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
         self.answer = answer
         self.tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+        self.unanswerable_skip_rate = unanswerable_skip_rate
+        self.skip_counter = 0
 
         # question / answerの辞書を作成
         self.question2idx = {}
@@ -134,6 +148,7 @@ class VQADataset(torch.utils.data.Dataset):
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
+
 
     def update_dict(self, dataset):
         """
@@ -177,6 +192,12 @@ class VQADataset(torch.utils.data.Dataset):
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
             mode_answer_idx = mode(answers)  # 最頻値を取得（正解ラベル）
+            mode_answer = self.idx2answer[mode_answer_idx]
+
+            if mode_answer.lower() == "unanswerable":
+                self.skip_counter += 1
+                if self.skip_counter % 3 != 0:  # 3回に2回スキップ
+                    return self.__getitem__((idx + 1) % len(self))  # 次のサンプルを取得
 
             return image, question_tokens['input_ids'].squeeze(), torch.Tensor(answers), int(mode_answer_idx)
 
@@ -209,7 +230,7 @@ def VQA_criterion(batch_pred: torch.Tensor, batch_answers: torch.Tensor):
 class VQAModel(nn.Module):
     def __init__(self, vocab_size: int, n_answer: int):
         super().__init__()
-        self.resnet = torchvision.models.resnet50(pretrained=True)
+        self.resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
         self.resnet.fc = nn.Linear(self.resnet.fc.in_features, 512)
         self.text_encoder = BertModel.from_pretrained('bert-base-uncased')
 
@@ -275,15 +296,15 @@ def eval(model, dataloader, optimizer, criterion, device):
 
     return total_loss / len(dataloader), total_acc / len(dataloader), simple_acc / len(dataloader), time.time() - start
 
-
-
 # deviceの設定
 set_seed(42)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # dataloader / model
 transform = transforms.Compose([
-            transforms.RandomResizedCrop(224),
+            transforms.Resize((256, 256)),
+            transforms.RandomCrop(224),
+            transforms.RandomRotation(degrees=15),
             transforms.RandomHorizontalFlip(),
             transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.2),
             transforms.ToTensor(),
@@ -291,13 +312,12 @@ transform = transforms.Compose([
             ])
 
 val_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
             ])
 
-train_dataset = VQADataset(df_path="/content/drive/MyDrive/3.Develop/Practice/DL基礎/2_最終課題/VQA_competition_without_git_clone/data/train.json", image_dir="/content/data/train", transform=transform)
+train_dataset = VQADataset(df_path="/content/drive/MyDrive/3.Develop/Practice/DL基礎/2_最終課題/VQA_competition_without_git_clone/data/train.json", image_dir="/content/data/train", transform=transform, answer=True, unanswerable_skip_rate=0.3)
 test_dataset = VQADataset(df_path="/content/drive/MyDrive/3.Develop/Practice/DL基礎/2_最終課題/VQA_competition_without_git_clone/data/valid.json", image_dir="/content/data/valid", transform=val_transform, answer=False)
 test_dataset.update_dict(train_dataset)
 
@@ -307,9 +327,9 @@ test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=Fa
 model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
 
 # optimizer / criterion
-num_epoch = 3
+num_epoch = 5
 criterion = nn.CrossEntropyLoss()
-lr = 0.001
+lr = 0.01
 optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
 
 # train model
@@ -333,4 +353,4 @@ for image, question in test_loader:
 submission = [train_dataset.idx2answer[id] for id in submission]
 submission = np.array(submission)
 torch.save(model.state_dict(), f"/content/drive/MyDrive/3.Develop/Practice/DL基礎/2_最終課題/VQA_competition_without_git_clone/output/正解率:{train_acc:.4f}_学習回数:{num_epoch}_学習率:{lr}_model.pth")
-np.save(f"/content/drive/MyDrive/3.Develop/Practice/DL基礎/2_最終課題/VQA_competition_without_git_clone/output/正解率:{train_acc:.4f}_学習回数:{num_epoch}_学習率:{lr}_submission.npy", submission)
+np.save(f"/content/drive/MyDrive/3.Develop/Practice/DL基礎/2_最終課題/VQA_competition_without_git_clone/output/正解率:{train_acc:.4f}_学習回数:{15}_学習率:{lr}_submission.npy", submission)
